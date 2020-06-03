@@ -1,5 +1,5 @@
 /*
- * Run an e2e UI test
+ * Run an e2e smoke test
  *
  * Required plugins:
  *  Blue Ocean / all the 'typical' plugins for GitHub multi-branch pipelines
@@ -40,7 +40,8 @@ private def getRefSpec() {
 
 
 private def deployEnvironment(
-    refSpec, project, ocDeployerBuilderPath, ocDeployerComponentPath, ocDeployerServiceSets, buildScaleFactor
+    refSpec, project, ocDeployerBuilderPath, ocDeployerComponentPath, ocDeployerServiceSets,
+    buildScaleFactor, parallelBuild
 ) {
     /**
      * Pipeline stages for running ocdeployer.
@@ -54,66 +55,76 @@ private def deployEnvironment(
         to use the image produced by the above custom build config
      * Deploys the specified `ocDeployerServiceSets` using the above config
      */
-    stage("Deploy test environment") {
-        dir(pipelineVars.e2eDeployDir) {
-            def deployTasks = [:]
+    stage("Create env files") {
+        // deploy custom build config that points to this app's PR code
+        def customBuildYaml = (
+            """
+            "${ocDeployerBuilderPath}":
+                parameters:
+                    SOURCE_REPOSITORY_REF: ${refSpec}
+            """
+        ).stripIndent()
+        writeFile file: "env/builder-env.yml", text: customBuildYaml
+        sh "cat env/builder-env.yml"
 
-            // deploy custom build config that points to this app's PR code
-            def customBuildYaml = (
-               """
-                "${ocDeployerBuilderPath}":
-                    parameters:
-                        SOURCE_REPOSITORY_REF: ${refSpec}
-                """
-            ).stripIndent()
-            writeFile file: "env/builder-env.yml", text: customBuildYaml
-            sh "cat env/builder-env.yml"
+        // set image for the PR app to be pulled from this local namespace
+        def customAppYaml = (
+            """
+            "${ocDeployerComponentPath}":
+                parameters:
+                    IMAGE_NAMESPACE: ${project}
+                    IMAGE_TAG: latest
+            """
+        ).stripIndent()
+        writeFile file: "env/custom-env.yml", text: customAppYaml
+        sh "cat env/custom-env.yml"
+    }
 
-            // set image for the PR app to be pulled from this local namespace
-            def customAppYaml = (
-                """
-                "${ocDeployerComponentPath}":
-                    parameters:
-                        IMAGE_NAMESPACE: ${project}
-                        IMAGE_TAG: latest
-                """
-            ).stripIndent()
-            writeFile file: "env/custom-env.yml", text: customAppYaml
-            sh "cat env/custom-env.yml"
+    def deployTasks = [:]
 
-            // Deploy the builder for only this app to build the PR image in this project
-            stage("Deploy buildConfig") {
-                def pickArg = ocDeployerBuilderPath.contains("/") ? "-p" : "-s"
-                // use --scale-resources to beef up the build resources to help the app build quickly
-                sh(
-                    "ocdeployer deploy -w -f -l e2esmoke=true ${pickArg} " +
-                    "${ocDeployerBuilderPath} -t buildfactory -e builder-env " +
-                    "-e smoke ${project} --scale-resources ${buildScaleFactor} --secrets-src-project secrets"
-                )
-            }
+    // Deploy the builder for only this app to build the PR image in this project
+    // Make this a closure so we can decide whether to run it stand-alone or in parallel later...
+    def buildTask = {
+        def pickArg = ocDeployerBuilderPath.contains("/") ? "-p" : "-s"
+        // use --scale-resources to beef up the build resources to help the app build quickly
+        sh(
+            "ocdeployer deploy -w -f -l e2esmoke=true ${pickArg} " +
+            "${ocDeployerBuilderPath} -t buildfactory -e builder-env " +
+            "-e smoke ${project} --scale-resources ${buildScaleFactor} --secrets-src-project secrets"
+        )
+    }
 
-            // Deploy the other service sets
-            for (serviceSet in ocDeployerServiceSets.split(',')) {
-                def set = serviceSet // https://jenkins.io/doc/pipeline/examples/#parallel-multiple-nodes
-                deployTasks["Deploy ${serviceSet}"] = {
-                    sh(
-                        "ocdeployer deploy -w -f -l e2esmoke=true -s ${set} " +
-                        "-e custom-env -e smoke ${project} --secrets-src-project secrets"
-                    )
-                }
-            }
-
-            // Run the service deployments in parallel
-            parallel(deployTasks)
+    // if running build in parallel, the build will run while the services are deploying
+    // if this is not feasible because the build takes too long and the service deploys time out,
+    // then the build can be run prior to the app deployment
+    if (parallelBuild) deployTasks['Deploy buildConfig'] = buildTask
+    else {
+        stage("Deploy buildConfig") {
+            buildTask()
         }
     }
+
+    // Deploy the other service sets
+    for (serviceSet in ocDeployerServiceSets.split(',')) {
+        def set = serviceSet // https://jenkins.io/doc/pipeline/examples/#parallel-multiple-nodes
+        deployTasks["Deploy ${serviceSet}"] = {
+            sh(
+                "ocdeployer deploy -w -f -l e2esmoke=true -s ${set} " +
+                "-e custom-env -e smoke ${project} --secrets-src-project secrets"
+            )
+        }
+    }
+
+    // Run the service deployments in parallel
+    parallel(deployTasks)
 }
 
 
 private def runPipeline(
     String refSpec, String project, String ocDeployerBuilderPath, String ocDeployerComponentPath,
     String ocDeployerServiceSets, pytestMarker, List<String> iqePlugins, Map extraEnvVars,
-    String configFileCredentialsId, int buildScaleFactor
+    String configFileCredentialsId, int buildScaleFactor, int parallelWorkerCount,
+    Boolean parallelBuild, String cloud, Boolean ui
 ) {
     /* Deploy a test env to 'project' in openshift, checkout e2e-tests, run the smoke tests */
 
@@ -132,80 +143,39 @@ private def runPipeline(
         }
     }
 
-    pipelineUtils.stageIf(iqePlugins, "Install plugins") {
-        for (plugin in iqePlugins) {
-            def pluginName
-
-            // Check if the plugin name was given in "iqe-NAME-plugin" format or just "NAME"
-            // strip unnecessary whitespace first
-            plugin = plugin.replaceAll("\\s", "")
-
-            if (plugin ==~ /iqe-\S+-plugin.*/) pluginName = plugin.replaceAll(/iqe-(\S+)-plugin/, '$1')
-            else pluginName = plugin
-
-            sh "iqe plugin install ${pluginName}"
-        }
-    }
-
     // wipe all resources that have label 'e2esmoke=true'
     stage("Wipe test environment") {
         sh "ocdeployer wipe -l e2esmoke=true --no-confirm ${project}"
     }
 
     try {
-        deployEnvironment(
-            refSpec, project, ocDeployerBuilderPath, ocDeployerComponentPath, ocDeployerServiceSets, buildScaleFactor
-        )
+        dir(pipelineVars.e2eDeployDir) {
+            deployEnvironment(
+                refSpec, project, ocDeployerBuilderPath, ocDeployerComponentPath,
+                ocDeployerServiceSets, buildScaleFactor, parallelBuild
+            )
+        }
     } catch (err) {
         echo("Hit error during deploy!")
         echo(err.toString())
         openShiftUtils.collectLogs(project: project)
-        throw err
+        error("Deployment failed")
     }
 
-    if (configFileCredentialsId) {
-        stage("Inject custom config") {
-            withCredentials(
-                [file(credentialsId: configFileCredentialsId, variable: 'SETTINGS_YAML')]
-            ) {
-                  sh "mkdir -p \$IQE_TESTS_LOCAL_CONF_PATH"
-                  sh "cp \$SETTINGS_YAML \$IQE_TESTS_LOCAL_CONF_PATH"            }
-        }
-    }
-    
-    if (pytestMarker instanceof String) {
-        pytestMarker = [pytestMarker]
-    }
-    
-    stage("Run tests (pytest markers: ${pytestMarker})") {
-        extraEnvVars.each { key, val ->
-            sh "export ${key}=${val}"
-        }
+    // create the appConfig used by iqeUtils
+    def appConfigs = [
+        smoke: [
+            plugins: iqePlugins,
+            ui: ui,
+            parallelWorkerCount: parallelWorkerCount,
+            settingsFileCredentialsId: configFileCredentialsId,
+            extraEnvVars: [envVar(key: 'DYNACONF_OCPROJECT', value: project)]
+        ],
+    ]
 
-        // tee the output -- the 'junit' step later will change build status if any tests fail
-        iqeCommand = (
-            "iqe tests plugin automation_analytics -v -s -m ${params['env']} --junitxml=junit.xml --log-file=iqe.log " +
-            "--log-file-level=DEBUG 2>&1 | tee pytest-stdout.log"
-        )
-
-        sh(
-            """
-            export DYNACONF_MAIN='{use_beta=${params['use_beta']}'
-            export DYNACONF_OCPROJECT=${project}
-            printenv
-            set +e
-            ${iqeCommand}
-            set -e
-            """.stripIndent()
-        )
-        sh 'printenv'
-        try {
-            archiveArtifacts "pytest-stdout.log"
-            archiveArtifacts "iqe.log"
-        } catch (err) {
-            echo "Error archiving log files: ${err.toString()}"
-        }
-    }
+    def results = pipelineUtils.runParallel(
+        iqeUtils.prepareStages(appConfigs, cloud, "smoke", pytestMarker, false, false)
+    )
 
     openShiftUtils.collectLogs(project: project)
 
@@ -213,9 +183,7 @@ private def runPipeline(
         sh "ocdeployer wipe -l e2esmoke=true --no-confirm ${project}"
     }
 
-    junit "junit.xml"
-
-    if (currentBuild.result != "SUCCESS") {
+    if (currentBuild.result != "SUCCESS" || results['failed'].size() > 0) {
         error("Smoke test failed");
     }
 }
@@ -224,27 +192,28 @@ private def runPipeline(
 private def allocateResourcesAndRun(
     String refSpec, String ocDeployerBuilderPath, String ocDeployerComponentPath,
     String ocDeployerServiceSets, pytestMarker, List<String> iqePlugins, Map extraEnvVars,
-    String configFileCredentialsId, int buildScaleFactor
+    String configFileCredentialsId, int buildScaleFactor, int parallelWorkerCount,
+    Boolean parallelBuild, String cloud, Boolean ui
 ) {
     // Reserve a smoke test project, spin up a slave pod, and run the test pipeline
     lock(label: pipelineVars.smokeTestResourceLabel, quantity: 1, variable: "PROJECT") {
         echo "Using project: ${env.PROJECT}"
 
-        envVars = [
-                envVar(key: 'ENV_FOR_DYNACONF', value: params['env']),
-                envVar(key: 'IQE_TESTS_LOCAL_CONF_PATH', value: '/tmp/settings_yaml'),
-            ]
-        openShiftUtils.withUINode(
+        envVars = [envVar(key: 'ENV_FOR_DYNACONF', value: 'smoke')]
+        parameters = [
             image: pipelineVars.iqeCoreImage,
+            namespace: env.PROJECT,
             envVars: envVars,
             resourceLimitCpu: '1',
             resourceLimitMemory: '2Gi',
-            cloud: 'openshift'
-        ) {
+            cloud: cloud,
+        ]
+        openShiftUtils.withNodeSelector(parameters, ui) {
             runPipeline(
-                refSpec, env.PROJECT, ocDeployerBuilderPath, ocDeployerComponentPath,
+                refSpec, env.PROJECT, ocDeployerBuilderPath, ocDeployerComponentPath, 
                 ocDeployerServiceSets, pytestMarker, iqePlugins, extraEnvVars,
-                configFileCredentialsId, buildScaleFactor
+                configFileCredentialsId, buildScaleFactor, parallelWorkerCount, parallelBuild,
+                cloud, ui
             )
         }
     }
@@ -253,20 +222,16 @@ private def allocateResourcesAndRun(
 
 private def setParamDefaults(String refSpec) {
     properties(
-        [ parameters([
+        [parameters([
             string(
                 name: 'GIT_REF',
                 defaultValue: refSpec,
                 description: 'The git ref to deploy for this app during the smoke test'
-            ),
-            choice(
-                choices: ['qa', 'ci', 'prod'],
-                description: '',
-                name: 'env'
             )
         ])]
     )
 }
+
 
 def call(p = [:]) {
     def ocDeployerBuilderPath = p['ocDeployerBuilderPath']
@@ -277,6 +242,10 @@ def call(p = [:]) {
     def extraEnvVars = p.get('extraEnvVars', [:])
     def configFileCredentialsId = p.get('configFileCredentialsId', "")
     def buildScaleFactor = p.get('buildScaleFactor', 1)
+    def parallelWorkerCount = p.get('parallelWorkerCount', 2)
+    def parallelBuild = p.get('parallelBuild', false)
+    def cloud = p.get('cloud', "openshift")
+    def ui = p.get('ui', false)
 
     // If testing via a PR webhook trigger
     if (env.CHANGE_ID) {
@@ -297,7 +266,8 @@ def call(p = [:]) {
         gitUtils.withStatusContext("e2e-smoke") {
             allocateResourcesAndRun(
                 refSpec, ocDeployerBuilderPath, ocDeployerComponentPath, ocDeployerServiceSets,
-                pytestMarker, iqePlugins, extraEnvVars, configFileCredentialsId, buildScaleFactor
+                pytestMarker, iqePlugins, extraEnvVars, configFileCredentialsId, buildScaleFactor,
+                parallelWorkerCount, parallelBuild, cloud, ui
             )
         }
     // If testing via a manual trigger... we have no PR, so don't notify github/try to add PR label
@@ -308,7 +278,8 @@ def call(p = [:]) {
         def refSpec = params["GIT_REF"]
         allocateResourcesAndRun(
             refSpec, ocDeployerBuilderPath, ocDeployerComponentPath, ocDeployerServiceSets,
-            pytestMarker, iqePlugins, extraEnvVars, configFileCredentialsId, buildScaleFactor
+            pytestMarker, iqePlugins, extraEnvVars, configFileCredentialsId, buildScaleFactor,
+            parallelWorkerCount, parallelBuild, cloud, ui
         )
     }
 }
