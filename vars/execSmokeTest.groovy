@@ -202,7 +202,6 @@ private def allocateResourcesAndRun(
         envVars = [envVar(key: 'ENV_FOR_DYNACONF', value: 'smoke')]
         parameters = [
             image: pipelineVars.iqeCoreImage,
-            namespace: env.PROJECT,
             envVars: envVars,
             resourceLimitCpu: '1',
             resourceLimitMemory: '2Gi',
